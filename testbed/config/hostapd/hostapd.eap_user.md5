@@ -1,0 +1,3 @@
+# EAP user database for EAP-MD5 benchmark
+# MD5 requires username/password
+"md5user@bench.tld"   MD5   "benchpass123"

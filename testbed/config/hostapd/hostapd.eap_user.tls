@@ -1,0 +1,3 @@
+# EAP user database for EAP-TLS benchmark
+# TLS requires certificate-based auth, no password needed
+"user@tls-bench.tld"   TLS

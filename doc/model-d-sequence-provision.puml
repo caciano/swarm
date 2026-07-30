@@ -1,0 +1,236 @@
+@startuml provision-sequence
+skinparam dpi 140
+skinparam roundCorner 8
+skinparam noteFontSize 9
+skinparam sequenceMessageFontSize 9
+skinparam sequenceParticipantFontSize 10
+skinparam defaultFontSize 9
+skinparam defaultFontName Helvetica
+skinparam responseMessageBelowArrow true
+
+title EAP-DID Enrolment (Credential Issuance)\nFigure 4 -- Trust Model D: the Issuer DID is the only identifier published to the VDR
+
+box "Issuing Authority" #E3F2FD
+    participant "Issuer Agent" as issuer
+    participant "HTTP Proxy\n(Issuer)" as caddy_i
+end box
+box "Subject System" #E8F5E9
+    participant "HTTP Proxy\n(Holder)" as caddy_h
+    participant "Holder Agent" as holder
+end box
+database "Verifiable Data\nRegistry" as bc
+
+note over bc
+  <b>VDR</b>. Holds the Issuer DID document and credential
+  status lists. Any Verifier resolves the Issuer here
+  without contacting the Issuing Authority.
+  --
+  Under Model D no subject identifier is published.
+end note
+
+== 1. Identifier Creation ==
+
+issuer -> issuer : POST /did-registrar/dids\n{"documentTemplate":{"publicKeys":[\n  {"id":"issuanceKey","purpose":"assertionMethod"}]}}
+issuer -> issuer : state CREATED\ndid:prism:<hash>:<create operation>
+issuer -> bc : POST /did-registrar/dids/{did}/publications
+
+note over issuer, bc #FFFDE7
+  <b>DID publication (Issuer only).</b> The DID create operation is
+  anchored to the ledger. State transitions CREATED ->
+  PUBLICATION_PENDING -> PUBLISHED; settlement is on the order of
+  10 to 30 seconds and depends on the ledger slot time.
+
+  Once published the identifier is referenced in its short form,
+  did:prism:<hash>, since the document no longer needs to travel
+  with the identifier.
+end note
+
+bc --> issuer : PUBLISHED, did:prism:<hash>
+
+holder -> holder : POST /did-registrar/dids\n{"documentTemplate":{"publicKeys":[\n  {"id":"authKey","purpose":"authentication"}]}}
+holder -> holder : state CREATED\n<b>retained in long form; not published</b>
+
+note over holder, bc #DDF0FF
+  <b>Long form resolution</b>
+
+  A did:prism long form is did:prism:<hash>:<create operation>,
+  where <create operation> is the base64url-encoded document that
+  defines the identifier. Resolution is performed from the
+  identifier alone, with no VDR access:
+
+    resolve(long_form):
+      hash, op = split(long_form)
+      if SHA-256(op) != hash: reject
+      return public keys of decode(op)
+
+  The hash binds the document to the identifier, so an unpublished
+  identifier is no less verifiable than a published one.
+
+  Consequences under Model D:
+
+  o  No subject identifier is published, so none can be resolved,
+     correlated or enumerated by a third party.
+  o  Presentation validation is unaffected: the subject key is
+     recovered from the identifier itself.
+  o  Two authentication exchanges cannot be linked through the VDR.
+
+  The "authKey" key is secp256k1 and is the key that will sign
+  presentations using ES256K [RFC8812].
+end note
+
+== 2. DIDComm Connection Establishment ==
+
+issuer -> issuer : POST /connections {"label":"issuer-to-holder"}
+issuer -> issuer : construct OOB invitation
+issuer --> caddy_i : 200 {invitationUrl, thid}
+caddy_i --> caddy_h : invitationUrl
+caddy_h --> holder : invitationUrl
+
+note over issuer, holder #FFE8C0
+  <b>Out-of-band invitation</b> [DIDComm v2]
+
+    _oob = base64url({
+      "type":"https://didcomm.org/out-of-band/2.0/invitation",
+      "id":"<uuid>",
+      "from":"<issuer did:peer>",
+      "body":{"goal_code":"connect","accept":["didcomm/v2"]}})
+
+  The "from" value is a did:peer:2 carrying its key material
+  inline. It is not published to the VDR.
+end note
+
+holder -> holder : POST /connection-invitations\n{"invitation":"<b64url oob>"}
+holder -> holder : state InvitationReceived
+holder -> issuer : DIDComm ConnectionRequest (JWE)
+
+note over holder, issuer #FFE8C0
+  <b>Enrolment channel encryption</b>
+  alg = "ECDH-ES+A256KW" [RFC7518]
+
+    (eph_sk, eph_pk) = X25519 keygen [RFC7748]
+    Z             = X25519(eph_sk, recipient_pk)
+    KEK           = Concat KDF with SHA-256 over Z
+    CEK           = random()
+    encrypted_key = AES Key Wrap(KEK, CEK) [RFC3394]
+    ciphertext    = AEAD(CEK, ConnectionRequest)
+
+  ECDH-ES derives the KEK from a single ephemeral-static
+  agreement. It provides confidentiality against third parties
+  but no assurance of origin: any party may encrypt to a
+  published public key. This is sufficient for enrolment, where
+  origin is established by the enclosing protocol.
+
+  The authentication exchange uses ECDH-1PU instead, which
+  additionally incorporates the sender's static key. See Figure 3,
+  Section 3.3.
+end note
+
+issuer -> issuer : receiveConnectionRequest;\nacceptConnectionRequest\nstate ConnectionResponseSent
+issuer -> holder : DIDComm ConnectionResponse (JWE)
+
+note over issuer #FFF3E0
+  <b>Implementation note.</b> The connection may remain in
+  ConnectionResponseSent. This does not block issuance: the
+  Holder Agent creates its peer DID independently.
+end note
+
+holder -> holder : receiveConnectionResponse
+
+== 3. Credential Schema ==
+
+issuer -> issuer : POST /schema-registry/schemas\n{"name":"eduroam-cred-<timestamp>",\n "version":"1.0.0", "author":"<issuer DID>",\n "schema":{...}}
+issuer --> issuer : 200 {guid}\nschemaId = .../schemas/{guid}/schema
+
+note over issuer #E3F2FD
+  The schema fixes the credential shape, here
+  {name: string, institution: string}. The Verifier names this
+  schemaId in the presentation request and checks the credential
+  against it during validation.
+end note
+
+== 4. Credential Issuance ==
+
+issuer -> issuer : POST /issue-credentials/credential-offers\n{"claims":{...}, "credentialFormat":"JWT",\n "issuingDID":"<issuer DID>", "schemaId":"<schemaId>"}
+issuer -> holder : DIDComm OfferCredential
+holder -> holder : state OfferReceived
+holder -> issuer : POST /accept-offer\n{"subjectId":"<holder long form>"}
+
+note over holder, issuer #DDF0FF
+  The subjectId is the long form identifier. This value becomes
+  the "sub" claim of the credential, and the peer reads the
+  identity under which it signs presentations from that claim
+  rather than from configuration, so the two cannot diverge.
+end note
+
+issuer -> issuer : issue credential
+
+note over issuer #E3F2FD
+  <b>Verifiable Credential, JWT serialization</b>
+  [RFC7519] [VC-DATA-MODEL]
+
+  Protected header:
+    {"alg":"ES256K", "typ":"JWT",
+     "kid":"<issuer DID>#issuanceKey"}
+
+  Claims:
+    iss  <issuer DID>            short form; published to the VDR
+    sub  <holder long form>      not published
+    vc   { "@context":[...],
+           "type":["VerifiableCredential"],
+           "credentialSchema":{"id":"<schemaId>"},
+           "credentialStatus":{...},
+           "credentialSubject":{"name":..., "institution":...} }
+
+  Signature: ECDSA over secp256k1 with SHA-256 [RFC8812], encoded
+  as R || S, 32 octets each, with S normalised to the lower half
+  of the group order.
+
+  ES256K rather than EdDSA: did:prism keys are secp256k1.
+
+  A Verifier resolves "iss" from the VDR, obtains issuanceKey and
+  verifies. <b>The Issuer is not contacted again.</b>
+end note
+
+issuer -> holder : DIDComm IssueCredential
+holder -> holder : state CredentialReceived
+
+== 5. Peer Provisioning ==
+
+note over holder #E8F5E9
+  <b>Material transferred to the EAP peer</b>
+
+  1. The credential (JWT).
+
+  2. The secp256k1 private key of "authKey", which signs
+     presentations. It is not stored directly: the agent derives
+     it from the wallet seed by hierarchical derivation
+     m/29'/29'/<did_index>'/<usage>'/<key_index>'. The derived
+     public key is checked against the DID create operation before
+     the private key is released.
+
+  3. The peer did:peer:2 and its X25519 key pair, used by the
+     DIDComm layer during authentication (ECDH-1PU).
+
+  On a production device no extraction occurs: the wallet retains
+  the keys and performs signatures on request. Extraction here
+  permits the EAP peer to operate without a local agent.
+end note
+
+== 6. Resulting State ==
+
+note over issuer, bc #DFFFD8
+  <b>Enrolment complete</b>
+
+  |= Artefact|= Form|= Published|
+  | Issuer DID | did:prism:<hash> (short form) | <b>yes</b> |
+  | Subject DID | did:prism:<hash>:<op> (long form) | <b>no</b> |
+  | Peer DID (subject) | did:peer:2 | no |
+  | Schema | URI in the Issuer registry | no |
+  | Credential | JWT, ES256K, issued by the Issuer | no |
+  | Status list | published by the Issuer | referenced |
+
+  Subsequent authentication exchanges contact neither the Issuer
+  nor the Holder Agent. See Figure 3.
+end note
+
+@enduml

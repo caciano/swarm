@@ -1,0 +1,14 @@
+# hostapd EAP user database.
+# Format:  "identity"   METHOD[ METHOD2 ...]   ["password"]   [flags]
+
+# EAP-DID user
+"user@inst.tld"   DID
+
+# EAP-MD5 user
+"md5user@bench.tld"   MD5   "benchpass123"
+
+# EAP-TLS user (cert-based, identity matches CN=supplicant)
+"user@tls-bench.tld"   TLS
+
+# PEAP/TTLS outer identity (phase1) — decoy
+"anonymous@inst.tld"   TTLS,MD5

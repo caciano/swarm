@@ -1,0 +1,80 @@
+@startuml sequence
+title EAP-DID Authentication Exchange (Overview)\nFigure 2 -- see model-d-sequence-complete.puml for cryptographic detail
+
+skinparam defaultFontName Helvetica
+
+actor "EAP Peer\n(supplicant)" as Supp
+participant "Authenticator\n(802.1X PAE)" as AP
+participant "EAP Server\n(EAP-DID)" as AAA
+participant "Verifier" as Verifier
+database "Verifiable Data\nRegistry" as Ledger
+
+note over Supp
+  The peer holds the VC and the subject signing key
+  from enrolment and constructs the presentation
+  locally. No Holder agent is reachable at this point.
+end note
+
+== Presentation Request ==
+
+AAA -> AAA : challenge = base64url(random(24 octets))\n<i>generated per authentication exchange</i>
+AAA -> Verifier : POST presentation invitation\n{schemaId, trustIssuers,\n options{challenge, domain}}
+Verifier -> Verifier : mint did:peer for this exchange
+Verifier -> AAA : {thid, invitationUrl, myDid}
+AAA -> Verifier : retrieve X25519 private key for myDid\n<i>non-normative key service</i>
+Verifier -> AAA : JWK {kty:"OKP", crv:"X25519", d, x}
+AAA -> AP : EAP-Request/DID (fragment 1..N)
+AP -> Supp : EAP-Request/DID (fragment 1..N)
+Supp -> AP : EAP-Response/DID (fragment ACK)
+AP -> AAA : EAP-Response/DID
+
+== Presentation ==
+
+Supp -> Supp : construct VP JWT [RFC7519]\nalg=ES256K [RFC8812]\niss = VC "sub"; aud = domain;\nnonce = challenge; jti; iat; exp
+Supp -> Supp : encapsulate in DIDComm message;\nencrypt as JWE [RFC7516]\nECDH-1PU + A256KW + A256CBC-HS512\nCEK = random(64 octets), retained
+Supp -> AP : EAP-Response/DID\ngzip(JWE) [RFC1952], fragment 1..N
+AP -> AAA : EAP-Response/DID (reassembled)
+
+== Validation ==
+
+AAA -> AAA : unwrap Verifier recipient entry\n-> recover the same CEK\n<i>AES Key Wrap fails on key mismatch</i>
+AAA -> Verifier : POST JWE\n(application/didcomm-encrypted+json)
+Verifier -> Verifier : JWE decryption; extract VP JWT
+Verifier -> Ledger : resolve issuer DID;\nretrieve credential status
+Ledger -> Verifier : DID document; status
+Verifier -> Verifier : validate signature, holder binding,\nvalidity period, challenge, domain,\nschema, trusted issuers, revocation
+Verifier -> AAA : PresentationVerified
+
+== Key Derivation ==
+
+Supp -> Supp : MSK, EMSK = HKDF(CEK, salt=thid) [RFC5869]
+AAA -> AAA : MSK, EMSK = HKDF(CEK, salt=thid) [RFC5869]
+
+note over Supp, AAA
+  The CEK is never transmitted over the EAP channel.
+  Each side obtains it independently: the peer generates
+  it when constructing the JWE; the EAP server recovers it
+  by unwrapping the recipient entry. The thid is unique per
+  exchange and is used as the HKDF salt, so repeated
+  presentations of the same credential yield distinct keys.
+end note
+
+== Completion ==
+
+AAA -> AP : EAP-Success [RFC3748]
+AP -> Supp : EAP-Success\n(4-Way Handshake follows on IEEE 802.11 media)
+
+note over Supp, Ledger
+  The Issuer does not participate in this exchange. It is
+  contacted once during enrolment (Figure 4). Only its DID
+  is resolved here, and only by the Verifier.
+  --
+  <b>Model D limitation.</b> The Verifier did:peer is conveyed
+  in band within the invitation and is not authenticated to
+  the peer. An adversarial Authenticator can substitute its
+  own identifier and read the presentation. It cannot replay
+  the presentation elsewhere: nonce and aud bind it to this
+  exchange, and exp bounds its lifetime.
+end note
+
+@enduml

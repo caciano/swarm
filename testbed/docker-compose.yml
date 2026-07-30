@@ -1,0 +1,556 @@
+name: swarm-testbed
+
+x-hostap-build: &hostap-build
+  context: ..
+  dockerfile: testbed/Dockerfile
+
+x-hostap-common: &hostap-common
+  image: swarm-testbed:latest
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  init: true
+
+# The networks are the administrative domains, not the roles. The Issuer belongs
+# to the home institution, the Verifier and the authenticator to the visited
+# one, and the two institutions share nothing but the ledger and the Issuer's
+# public documents. Anything that crosses a boundary here has to be something
+# that could cross it in the real deployment.
+networks:
+  # 802.1X between the device and the authenticator. While a device is
+  # authenticating this is the only path it has off itself — and it is not a
+  # network at all, it is a wire: the uncontrolled port of an authenticator,
+  # with no address on either end and nothing on it but EAPoL.
+  #
+  # The subnet below is declared because Docker's bridge driver refuses to
+  # create a network without an IPAM pool. Nothing uses it: inhibit_ipv4 keeps
+  # the address off the bridge, so neither the host nor a gateway is on the
+  # segment; the entrypoints flush the address Docker assigns before hostapd
+  # and wpa_supplicant start; and scripts/eapol-guard.sh installs a bridge ACL
+  # that drops every ethertype but EAPoL, so an address configured by hand
+  # would buy nothing either. isolation.sh asserts all three.
+  eapol-net:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: swarm-br0
+      com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+  # The user's device: the supplicant and the wallet holding its credential.
+  # Deliberately joined to nothing else — no institution, no ledger. During
+  # enrolment the device is attached to provision-net instead, and that network
+  # does not outlive provision.sh.
+  device-net:
+    driver: bridge
+
+  # The visited institution. The authenticator and the Verifier are two
+  # processes of one security domain, and this network is assumed trusted
+  # between them — the assumption eduroam already makes between an access point
+  # and its authentication server.
+  auth-net:
+    driver: bridge
+
+  # The home institution.
+  issuer-net:
+    driver: bridge
+
+  # What anyone may read: the Issuer's schema and revocation status list, and
+  # the ledger. A verifier that has never met an issuer resolves it here.
+  internet:
+    driver: bridge
+
+  # The ledger's storage. The node is public; its database is not.
+  ledger-net:
+    driver: bridge
+
+configs:
+  caddyfile_holder:
+    content: |-
+      :8081 {
+        handle_path /didcomm* {
+          reverse_proxy agent-holder:8090
+        }
+        handle_path /cloud-agent* {
+          reverse_proxy agent-holder:8085
+        }
+      }
+  caddyfile_issuer:
+    content: |-
+      :8080 {
+        handle_path /didcomm* {
+          reverse_proxy agent-issuer:8090
+        }
+        handle_path /cloud-agent* {
+          reverse_proxy agent-issuer:8085
+        }
+      }
+  caddyfile_verifier:
+    content: |-
+      :8082 {
+        handle_path /didcomm* {
+          reverse_proxy agent-verifier:8090
+        }
+        handle_path /cloud-agent* {
+          reverse_proxy agent-verifier:8085
+        }
+      }
+
+volumes:
+  pg_data_holder: {}
+  pg_data_issuer: {}
+  pg_data_node: {}
+  pg_data_verifier: {}
+
+services:
+  # ═══════════════════════════════════════════════════════════
+  # EAP Layer (profile: test)
+  # ═══════════════════════════════════════════════════════════
+  # Configures the EAP segment before anything is on it: EAPoL forwarding
+  # across the bridge, and the ACL that lets nothing else across. It runs in
+  # the host network namespace because the bridge and its ACL live there, and
+  # it exits as soon as it has verified its own work — the other two services
+  # wait for that. See scripts/eapol-guard.sh.
+  init-bridge:
+    <<: *hostap-common
+    build: *hostap-build
+    profiles: ["eap"]
+    container_name: swarm-init-bridge
+    network_mode: host
+    volumes:
+      - ./scripts/eapol-guard.sh:/usr/local/sbin/eapol-guard.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/sbin/eapol-guard.sh"]
+    command: ["apply"]
+    restart: "no"
+
+  authradius:
+    <<: *hostap-common
+    build: *hostap-build
+    profiles: ["eap"]
+    container_name: swarm-authradius
+    hostname: authradius
+    environment:
+      AUTH_CONF: ${AUTH_CONF:-/etc/hostapd/hostapd.conf}
+      RADIUS_CONF: ${RADIUS_CONF:-/etc/hostapd/radius.conf}
+      EAP_IFACE: eth1
+      ISSUER_DID: ${ISSUER_DID:-}
+      SCHEMA_ID: ${SCHEMA_ID:-}
+      LOG_LEVEL: INFO
+      DID_VERIFIER_BASE_URL: http://caddy-verifier:8082
+      DID_VERIFIER_KEY_URL: http://verifier-keys:8090/peer-did-key
+      DID_DOMAIN: ${DID_DOMAIN:-eduroam}
+    volumes:
+      - ./config/hostapd:/etc/hostapd:ro
+      - ./config/certs:/etc/certs:ro
+      - ./entrypoint-authradius.sh:/usr/local/sbin/entrypoint-authradius.sh:ro
+    entrypoint: ["/usr/local/sbin/entrypoint-authradius.sh"]
+    # No IPv6 on any port of this container: the EAP port is meant to carry no
+    # address at all, and a kernel-assigned link-local one would be an address.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    depends_on:
+      init-bridge:
+        condition: service_completed_successfully
+    networks:
+      # No ipv4_address: nothing here is addressed. Docker allocates one from
+      # the pool anyway; the entrypoint flushes it before hostapd starts.
+      eapol-net: {}
+      auth-net:
+        aliases:
+          - authradius
+
+  supplicant:
+    <<: *hostap-common
+    build: *hostap-build
+    profiles: ["eap"]
+    container_name: swarm-supplicant
+    hostname: supplicant
+    environment:
+      WPA_CONF: ${WPA_CONF:-/etc/wpa_supplicant/wpa_supplicant.conf}
+      EAP_IFACE: eth1
+      START_DELAY: "3"
+      LOG_LEVEL: INFO
+      # did: standalone peer credentials
+      DID_HOLDER_DID: ${DID_HOLDER_DID:-}
+      DID_CREDENTIAL_FILE: /etc/did/credential.jwt
+      # Private keys are named by path, never carried in the environment:
+      # /proc/<pid>/environ, every child process and ps e all read that.
+      DID_ED25519_KEY_FILE: /etc/did/ed25519_priv.b64url
+      DID_X25519_KEY_FILE: /etc/did/x25519_keys.json
+      DID_SECP256K1_PRIV_FILE: /etc/did/holder_secp256k1_priv.b64url
+      DID_PRISM_KEY_ID: ${DID_PRISM_KEY_ID:-}
+    volumes:
+      - ./config/wpa_supplicant:/etc/wpa_supplicant:ro
+      - ./config/certs:/etc/certs:ro
+      - ./did-keys/credential.jwt:/etc/did/credential.jwt:ro
+      - ./did-keys/ed25519_priv.b64url:/etc/did/ed25519_priv.b64url:ro
+      - ./did-keys/x25519_keys.json:/etc/did/x25519_keys.json:ro
+      - ./did-keys/holder_secp256k1_priv.b64url:/etc/did/holder_secp256k1_priv.b64url:ro
+    entrypoint: ["/usr/local/sbin/entrypoint-supplicant.sh"]
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    depends_on:
+      init-bridge:
+        condition: service_completed_successfully
+      authradius:
+        condition: service_started
+    networks:
+      # See authradius: the EAP port is address-less by the time the
+      # supplicant runs, and the bridge ACL enforces it.
+      eapol-net: {}
+      device-net:
+        aliases:
+          - supplicant
+
+  # ═══════════════════════════════════════════════════════════
+  # The user's device (device-net)
+  #
+  # The supplicant and the wallet that holds its credential. Nothing here can
+  # reach an institution or the ledger once provisioning is over; the
+  # supplicant does not even try, since the EAP-DID peer method makes no
+  # network call of its own.
+  # ═══════════════════════════════════════════════════════════
+  agent-holder:
+    profiles: ["identus"]
+    image: hyperledgeridentus/identus-cloud-agent:2.2.0
+    restart: always
+    depends_on:
+      node:
+        condition: service_started
+    environment:
+      ADMIN_TOKEN: admin
+      AGENT_DB_HOST: db-holder
+      AGENT_DB_NAME: agent
+      AGENT_DB_PASSWORD: postgres
+      AGENT_DB_PORT: "5432"
+      AGENT_DB_USER: postgres
+      API_KEY_ENABLED: "false"
+      CONNECT_DB_HOST: db-holder
+      CONNECT_DB_NAME: connect
+      CONNECT_DB_PASSWORD: postgres
+      CONNECT_DB_PORT: "5432"
+      CONNECT_DB_USER: postgres
+      DIDCOMM_SERVICE_URL: http://caddy-holder:8081/didcomm
+      POLLUX_DB_HOST: db-holder
+      POLLUX_DB_NAME: pollux
+      POLLUX_DB_PASSWORD: postgres
+      POLLUX_DB_PORT: "5432"
+      POLLUX_DB_USER: postgres
+      POLLUX_STATUS_LIST_REGISTRY_PUBLIC_URL: http://caddy-holder:8081/cloud-agent
+      PRISM_NODE_HOST: node
+      PRISM_NODE_PORT: "50053"
+      REST_SERVICE_URL: http://caddy-holder:8081/cloud-agent
+      SECRET_STORAGE_BACKEND: postgres
+    networks:
+      device-net:
+        aliases:
+          - agent-holder
+
+  caddy-holder:
+    profiles: ["identus"]
+    image: caddy:2.7.6-alpine
+    ports:
+      - 127.0.0.1:8081:8081
+    restart: always
+    configs:
+      - source: caddyfile_holder
+        target: /etc/caddy/Caddyfile
+    networks:
+      device-net:
+        aliases:
+          - caddy-holder
+
+  db-holder:
+    profiles: ["identus"]
+    image: postgres:13
+    restart: always
+    environment:
+      POSTGRES_MULTIPLE_DATABASES: pollux,connect,agent
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      timeout: 5s
+    volumes:
+      - pg_data_holder:/var/lib/postgresql/data
+      - ./config/postgres/init-script.sh:/docker-entrypoint-initdb.d/init-script.sh
+      - ./config/postgres/max_conns.sql:/docker-entrypoint-initdb.d/max_conns.sql
+    networks:
+      device-net:
+        aliases:
+          - db-holder
+
+  # ═══════════════════════════════════════════════════════════
+  # The visited institution (auth-net)
+  #
+  # The Verifier sits with the authenticator. It is also on internet, because
+  # verifying a presentation means resolving the Issuer's DID on the ledger and
+  # fetching the schema and the status list the credential names — public
+  # documents, over a public path. There is no private channel to the Issuer.
+  # ═══════════════════════════════════════════════════════════
+  agent-verifier:
+    profiles: ["identus"]
+    image: hyperledgeridentus/identus-cloud-agent:2.2.0
+    restart: always
+    depends_on:
+      node:
+        condition: service_started
+    environment:
+      ADMIN_TOKEN: admin
+      AGENT_DB_HOST: db-verifier
+      AGENT_DB_NAME: agent
+      AGENT_DB_PASSWORD: postgres
+      AGENT_DB_PORT: "5432"
+      AGENT_DB_USER: postgres
+      API_KEY_ENABLED: "false"
+      CONNECT_DB_HOST: db-verifier
+      CONNECT_DB_NAME: connect
+      CONNECT_DB_PASSWORD: postgres
+      CONNECT_DB_PORT: "5432"
+      CONNECT_DB_USER: postgres
+      DIDCOMM_SERVICE_URL: http://caddy-verifier:8082/didcomm
+      POLLUX_DB_HOST: db-verifier
+      POLLUX_DB_NAME: pollux
+      POLLUX_DB_PASSWORD: postgres
+      POLLUX_DB_PORT: "5432"
+      POLLUX_DB_USER: postgres
+      POLLUX_STATUS_LIST_REGISTRY_PUBLIC_URL: http://caddy-verifier:8082/cloud-agent
+      PRISM_NODE_HOST: node
+      PRISM_NODE_PORT: "50053"
+      REST_SERVICE_URL: http://caddy-verifier:8082/cloud-agent
+      SECRET_STORAGE_BACKEND: postgres
+      # Require the presentation to be issued by the DID the credential names
+      # as its subject. Without this a credential intercepted in transit could
+      # be presented by whoever holds it, which is the whole point of proof of
+      # possession. Both agents default it off; the presentation has satisfied
+      # it since the supplicant started signing as the credential subject.
+      PRESENTATION_VERIFY_HOLDER_BINDING: "true"
+      # Enforce the presentation validity window. Without it the exp the
+      # supplicant sets is decorative and a presentation stays good forever.
+      PRESENTATION_VERIFY_DATES: "true"
+      PRESENTATION_LEEWAY: 10 seconds
+    networks:
+      auth-net:
+        aliases:
+          - agent-verifier
+      internet:
+        aliases:
+          - agent-verifier
+
+  caddy-verifier:
+    profiles: ["identus"]
+    image: caddy:2.7.6-alpine
+    ports:
+      - 127.0.0.1:8082:8082
+    restart: always
+    configs:
+      - source: caddyfile_verifier
+        target: /etc/caddy/Caddyfile
+    networks:
+      auth-net:
+        aliases:
+          - caddy-verifier
+
+  db-verifier:
+    profiles: ["identus"]
+    image: postgres:13
+    restart: always
+    environment:
+      POSTGRES_MULTIPLE_DATABASES: pollux,connect,agent
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      timeout: 5s
+    volumes:
+      - pg_data_verifier:/var/lib/postgresql/data
+      - ./config/postgres/init-script.sh:/docker-entrypoint-initdb.d/init-script.sh
+      - ./config/postgres/max_conns.sql:/docker-entrypoint-initdb.d/max_conns.sql
+    networks:
+      auth-net:
+        aliases:
+          - db-verifier
+
+  # Hands the authenticator the key agreement key behind the peer DID the
+  # verifier minted for an invitation, which is what it unwraps the content
+  # encryption key with. Stands in for the authenticator verifying
+  # presentations itself; see scripts/verifier-key-service.py.
+  verifier-keys:
+    profiles: ["identus"]
+    image: postgres:13
+    restart: always
+    depends_on:
+      db-verifier:
+        condition: service_healthy
+    environment:
+      PGHOST: db-verifier
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: agent
+    volumes:
+      - ./scripts/verifier-key-service.py:/usr/local/bin/verifier-key-service.py:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if ! command -v python3 >/dev/null 2>&1; then
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends python3
+        fi
+        exec python3 /usr/local/bin/verifier-key-service.py --port 8090
+    healthcheck:
+      interval: 10s
+      retries: 10
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz')\""]
+      timeout: 5s
+    networks:
+      auth-net:
+        aliases:
+          - verifier-keys
+
+  # ═══════════════════════════════════════════════════════════
+  # The home institution (issuer-net, and internet — always)
+  #
+  # The Issuer is on internet permanently, and this is not a convenience: the
+  # ledger is not an enrolment-only need, and the schema and status list URLs
+  # embedded in the credential are fetched by the Verifier at every
+  # authentication, from an institution that has never met this one.
+  #
+  # What is temporary is not the Issuer's presence but the device's. The
+  # device reaches the Issuer over provision-net, which exists for the length
+  # of provision.sh and not one second longer.
+  # ═══════════════════════════════════════════════════════════
+  agent-issuer:
+    profiles: ["identus"]
+    image: hyperledgeridentus/identus-cloud-agent:2.2.0
+    restart: always
+    depends_on:
+      node:
+        condition: service_started
+    environment:
+      ADMIN_TOKEN: admin
+      AGENT_DB_HOST: db-issuer
+      AGENT_DB_NAME: agent
+      AGENT_DB_PASSWORD: postgres
+      AGENT_DB_PORT: "5432"
+      AGENT_DB_USER: postgres
+      API_KEY_ENABLED: "false"
+      CONNECT_DB_HOST: db-issuer
+      CONNECT_DB_NAME: connect
+      CONNECT_DB_PASSWORD: postgres
+      CONNECT_DB_PORT: "5432"
+      CONNECT_DB_USER: postgres
+      DIDCOMM_SERVICE_URL: http://caddy-issuer:8080/didcomm
+      POLLUX_DB_HOST: db-issuer
+      POLLUX_DB_NAME: pollux
+      POLLUX_DB_PASSWORD: postgres
+      POLLUX_DB_PORT: "5432"
+      POLLUX_DB_USER: postgres
+      POLLUX_STATUS_LIST_REGISTRY_PUBLIC_URL: http://caddy-issuer:8080/cloud-agent
+      PRISM_NODE_HOST: node
+      PRISM_NODE_PORT: "50053"
+      REST_SERVICE_URL: http://caddy-issuer:8080/cloud-agent
+      SECRET_STORAGE_BACKEND: postgres
+    networks:
+      issuer-net:
+        aliases:
+          - agent-issuer
+      internet:
+        aliases:
+          - agent-issuer
+
+  caddy-issuer:
+    profiles: ["identus"]
+    image: caddy:2.7.6-alpine
+    ports:
+      - 127.0.0.1:8080:8080
+    restart: always
+    configs:
+      - source: caddyfile_issuer
+        target: /etc/caddy/Caddyfile
+    networks:
+      issuer-net:
+        aliases:
+          - caddy-issuer
+      internet:
+        aliases:
+          - caddy-issuer
+
+  db-issuer:
+    profiles: ["identus"]
+    image: postgres:13
+    restart: always
+    environment:
+      POSTGRES_MULTIPLE_DATABASES: pollux,connect,agent
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      timeout: 5s
+    volumes:
+      - pg_data_issuer:/var/lib/postgresql/data
+      - ./config/postgres/init-script.sh:/docker-entrypoint-initdb.d/init-script.sh
+      - ./config/postgres/max_conns.sql:/docker-entrypoint-initdb.d/max_conns.sql
+    networks:
+      issuer-net:
+        aliases:
+          - db-issuer
+
+  # ═══════════════════════════════════════════════════════════
+  # The ledger (internet + ledger-net)
+  #
+  # The one thing the two institutions share, and the only thing they are
+  # allowed to. The node answers on internet; its database is reachable from
+  # the node alone.
+  # ═══════════════════════════════════════════════════════════
+  node:
+    profiles: ["identus"]
+    image: ghcr.io/input-output-hk/prism-node:2.4.0
+    restart: always
+    depends_on:
+      node-db:
+        condition: service_healthy
+    environment:
+      NODE_PSQL_DATABASE: node_db
+      NODE_PSQL_HOST: node-db:5432
+      NODE_PSQL_PASSWORD: postgres
+      NODE_PSQL_USERNAME: postgres
+    networks:
+      internet:
+        aliases:
+          - node
+      ledger-net:
+        aliases:
+          - node
+
+  node-db:
+    profiles: ["identus"]
+    image: postgres:13
+    restart: always
+    environment:
+      POSTGRES_MULTIPLE_DATABASES: node_db
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      timeout: 5s
+    volumes:
+      - pg_data_node:/var/lib/postgresql/data
+      - ./config/postgres/init-script.sh:/docker-entrypoint-initdb.d/init-script.sh
+      - ./config/postgres/max_conns.sql:/docker-entrypoint-initdb.d/max_conns.sql
+    networks:
+      ledger-net:
+        aliases:
+          - node-db

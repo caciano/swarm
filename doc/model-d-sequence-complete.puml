@@ -1,0 +1,425 @@
+@startuml model-d-sequence-complete
+skinparam dpi 140
+skinparam roundCorner 8
+skinparam noteFontSize 9
+skinparam sequenceMessageFontSize 9
+skinparam sequenceParticipantFontSize 10
+skinparam defaultFontSize 9
+skinparam defaultFontName Helvetica
+skinparam responseMessageBelowArrow true
+
+title EAP-DID Authentication Exchange (Detailed)\nFigure 3 -- Trust Model D: Issuer published to the VDR; Peer and Verifier identifiers unpublished
+
+box "Peer System" #E8F5E9
+    participant "EAP Peer\n(wpa_supplicant)" as peer
+end box
+box "Access Network" #E3F2FD
+    participant "EAP Server\n(hostapd)" as server
+end box
+box "Relying Infrastructure" #FFF3E0
+    participant "HTTP Proxy" as caddy_v
+    participant "Verifier" as verifier
+    participant "Key Service\n<i>non-normative</i>" as keysvc
+end box
+database "Verifiable Data\nRegistry" as bc
+
+note over bc
+  <b>VDR</b>. Holds the Issuer DID document and
+  credential status lists. Read by the Verifier
+  during validation. The peer performs no VDR
+  access at any point in this exchange.
+end note
+
+== 1. Method Negotiation and Presentation Request ==
+
+peer -> server : EAPOL-Start (EtherType 0x888E)
+server -> peer : EAP-Request/Identity
+peer -> server : EAP-Response/Identity
+server -> peer : EAP-Request/DID, Flags S=1, V=1
+peer -> server : EAP-Response/DID, Flags V=1
+
+note over peer, server
+  The Start exchange negotiates the method version before
+  any state is established. A peer that does not implement
+  version V terminates the exchange here.
+end note
+
+server -> server : challenge = base64url(random(24 octets)) [RFC4648]
+
+note over server #FFE0E0
+  <b>Freshness.</b> The challenge is the only element of the
+  request that the peer cannot predict. Signing it demonstrates
+  that the presentation was produced for this exchange.
+
+  A fixed challenge value causes every presentation produced by
+  every deployment to carry the same nonce and audience, so a
+  presentation observed once remains acceptable indefinitely and
+  at any Verifier. The challenge MUST therefore be generated per
+  exchange from a cryptographically secure source.
+end note
+
+server -> caddy_v : POST /present-proof/presentations/invitation\n{schemaId, trustIssuers:[issuer DID],\n options:{challenge, domain}}
+caddy_v -> verifier : (proxied)
+verifier -> verifier : mint did:peer for this exchange;\nconstruct OOB invitation [DIDComm v2]
+verifier --> caddy_v : 200 {thid, invitationUrl, myDid}
+caddy_v --> server : 200 {thid, invitationUrl, myDid}
+
+note over server, verifier #FFF3E0
+  The Verifier mints a new did:peer per invitation. Key material
+  extracted at enrolment is therefore stale by the time it would
+  be used, and the recipient key MUST be obtained per exchange.
+end note
+
+server -> keysvc : GET /peer-did-key?did=<myDid>
+keysvc -> verifier : key store read (key_id="agreement")
+keysvc --> server : JWK [RFC7517]\n{kty:"OKP", crv:"X25519", d, x}
+
+note over keysvc #FFCCCC
+  <b>Non-normative.</b> This interface discloses private key
+  material and has no place in a production deployment. It exists
+  only because the EAP server and the Verifier are distinct
+  processes here. It is removed when the EAP server performs VP
+  validation locally, at which point the key does not leave it.
+end note
+
+== 2. Request Transfer (Downlink Fragmentation) ==
+
+loop fragment_size = 1300 octets; approximately 2 fragments
+    server -> peer : EAP-Request/DID\nFlags: L (first only), M, V=1
+    peer -> peer : reassemble
+    peer -> server : EAP-Response/DID (Flags octet only)
+end
+
+note over peer, server
+  <b>EAP-DID Flags octet</b>
+
+  "" 0 1 2 3 4 5 6 7 ""
+  ""+-+-+-+-+-+-+-+-+""
+  ""|L|M|S|K|R| Ver |""
+  ""+-+-+-+-+-+-+-+-+""
+
+  L  Length Included. The following 4 octets carry the total
+     message length in network byte order.
+  M  More Fragments.
+  S  Start.
+  K  Reserved for key confirmation. MUST be set to zero.
+  R  Reserved. MUST be set to zero.
+  Ver  Version. This document describes version 1.
+
+  Each intermediate fragment is acknowledged with a payload
+  consisting of the Flags octet alone. The sender MUST NOT emit
+  the next fragment before the acknowledgement is received; a
+  reflected or replayed response therefore cannot advance the
+  transfer.
+
+  While awaiting the Verifier, the EAP server emits keepalive
+  requests carrying only the Flags octet. The retransmission
+  timeout reported to the EAP state machine is 5 seconds.
+end note
+
+note over peer
+  The reassembled invitation (approximately 2300 octets) conveys
+  thid, the Verifier did:peer ("from"), challenge and domain. The
+  peer extracts the X25519 public key from the key agreement
+  segment ("E") of the did:peer:2 identifier.
+end note
+
+== 3. Presentation Construction (Peer, Offline) ==
+
+note over peer #DDFFDD
+  <b>3.1 Verifiable Presentation, JWT serialization</b> [RFC7519] [VC-DATA-MODEL]
+
+  Protected header:
+    {"kid":"<VC sub>#authKey", "typ":"JWT", "alg":"ES256K"}
+
+  Claims:
+    iss    <VC "sub">          identity the presentation is made under
+    aud    <domain>            audience named by the request
+    nonce  <challenge>         freshness value from the request
+    jti    "urn:uuid:"||b64url(random(16 octets))
+    iat    current time
+    exp    iat + 300
+    vp     { "@context":[...], "type":["VerifiablePresentation"],
+             "verifiableCredential":[ <VC JWT> ] }
+
+  Signature: ECDSA over secp256k1 with SHA-256 [RFC8812], encoded
+  as R || S, 32 octets each. S is normalised to the lower half of
+  the group order; without this the same signature admits two
+  valid encodings.
+
+  <b>The "iss" value is read from the "sub" claim of the credential</b>
+  and never from configuration. The peer is therefore structurally
+  incapable of producing a presentation that violates holder
+  binding. nonce and aud bind the presentation to this exchange;
+  jti and exp bound its reuse even where the Verifier keeps no
+  replay state.
+
+  <b>3.2 DIDComm encapsulation</b> [DIDComm v2]
+
+    {"type":"https://didcomm.atalaprism.io/present-proof/3.0/presentation",
+     "id":"<thid>", "thid":"<thid>",
+     "from":"<peer did:peer>", "to":["<verifier did:peer>"],
+     "attachments":[{"format":"jwt_vc",
+                     "data":{"base64":"<b64url(VP JWT)>"}}]}
+end note
+
+note over peer #DDFFDD
+  <b>3.3 JWE construction</b> [RFC7516]
+  alg = "ECDH-1PU+A256KW" [ECDH-1PU]; enc = "A256CBC-HS512" [RFC7518]
+
+  Content encryption precedes key agreement, because the content
+  authentication tag is an input to the key derivation.
+
+  1. CEK = random(64 octets)
+       MAC_KEY = CEK[0..31]; ENC_KEY = CEK[32..63]   (RFC7518 5.2.2)
+       A256CBC-HS512 consumes two keys; the CEK is 64 octets, not 32.
+
+  2. (eph_sk, eph_pk) = X25519 keygen [RFC7748]
+
+  3. Protected header:
+       {"alg":"ECDH-1PU+A256KW", "enc":"A256CBC-HS512",
+        "epk":{"kty":"OKP","crv":"X25519","x":b64url(eph_pk)},
+        "skid":"<peer did:peer>#key-N",
+        "apu":b64url(skid),
+        "apv":b64url(SHA-256(recipient kids, sorted, "." joined))}
+
+  4. Content encryption (RFC7518 5.2.2.1):
+       AAD = ASCII(b64url(protected header))
+       IV  = random(16 octets)
+       CT  = AES-256-CBC(ENC_KEY, IV, PKCS#7(plaintext))
+       AL  = uint64be(bitlength(AAD))
+       T   = HMAC-SHA-512(MAC_KEY, AAD || IV || CT || AL)[0..31]
+
+       AL is appended last. Any other placement produces a
+       well-formed tag that no conforming recipient accepts.
+
+  5. Key agreement (ECDH-1PU, Section 2.2 of [ECDH-1PU]):
+       Ze = X25519(eph_sk,       recipient_pk)
+       Zs = X25519(sender_sk,    recipient_pk)
+       Z  = Ze || Zs
+
+       The ephemeral secret is first. Transposition yields a
+       different KEK and the recipient's unwrap fails.
+
+  6. KEK = Concat KDF with SHA-256 (NIST SP 800-56A 5.8.1) over Z,
+     OtherInfo as specified in Section 2.3 of [ECDH-1PU]:
+
+       uint32be(counter) || Z
+         || len32("ECDH-1PU+A256KW") || "ECDH-1PU+A256KW"
+         || len32(apu) || apu
+         || len32(apv) || apv
+         || uint32be(256)                 SuppPubInfo, keydatalen
+         || len32(T) || T                 SuppPrivInfo, the tag
+
+  7. encrypted_key = AES-256 Key Wrap(KEK, CEK) [RFC3394]
+
+  The JWE has a single recipient: the Verifier.
+
+  <b>3.4 Compression</b>
+  gzip [RFC1952] reduces approximately 9400 octets to 7000, which
+  is about five fewer EAP round trips.
+end note
+
+note over peer #E0E8FF
+  <b>Rationale: ECDH-1PU versus ECDH-ES</b>
+
+  ECDH-ES (used on the enrolment path, Figure 4) derives the KEK
+  from a single ephemeral-static agreement. The recipient obtains
+  confidentiality but no assurance of origin: any party may encrypt
+  to a published public key.
+
+  ECDH-1PU additionally incorporates the sender's static key, so
+  the KEK is derivable only by a party holding the private key
+  identified by "skid". Two consequences follow:
+
+  o  Sender authentication. The JWE demonstrates origin from the
+     peer's X25519 key.
+  o  Ciphertext binding. Including the content authentication tag
+     in the KDF (step 6) binds the wrapped key to this ciphertext;
+     it cannot be transplanted to another.
+end note
+
+== 4. Presentation Transfer (Uplink Fragmentation) ==
+
+loop fragment_size = 1300 octets; approximately 6 fragments
+    peer -> server : EAP-Response/DID\nFlags: L (first only), M, V=1
+    server -> server : reassemble
+    server -> peer : EAP-Request/DID (acknowledgement)
+end
+peer -> server : EAP-Response/DID (final fragment, M=0)
+
+== 5. CEK Recovery and Relay ==
+
+server -> server : gzip decompression
+
+note over server #E3F2FD
+  <b>The EAP server opens the JWE only far enough to recover the
+  key.</b> It does not parse the presentation and does not decide
+  its validity; that is the Verifier's function.
+
+  1. skid = protected header "skid"
+     sender_pk = key agreement segment of the did:peer in skid
+
+     The sender public key is obtained from the message itself.
+     No peer-specific configuration exists on the EAP server.
+
+  2. Ze = X25519(recipient_sk, eph_pk)      recipient_sk from Section 1
+     Zs = X25519(recipient_sk, sender_pk)
+     Z  = Ze || Zs                          same ordering as the sender
+
+  3. KEK = Concat KDF(Z, ..., T)            same OtherInfo
+  4. CEK = AES-256 Key Unwrap(KEK, encrypted_key) [RFC3394]
+
+  <b>Failure is detected, not silent.</b> [RFC3394] specifies a fixed
+  initial value A6A6A6A6A6A6A6A6 that is verified on unwrap. A KEK
+  differing in any bit causes rejection. A successful unwrap is
+  therefore evidence that the recovered CEK is the value the peer
+  generated, and not merely a well-formed key.
+end note
+
+server -> caddy_v : POST /didcomm\nContent-Type: application/didcomm-encrypted+json
+caddy_v -> verifier : (proxied)
+verifier -> verifier : JWE decryption using its own private key;\nextract VP JWT from attachment
+
+verifier -> bc : resolve VC "iss";\nretrieve credential status list
+bc --> verifier : DID document; revocation state
+
+note over verifier, bc #FFCC99
+  <b>Validation performed by the Verifier</b>
+
+  |= Check|= Property established|
+  | VP signature | signed by the key named in "kid" |
+  | <b>Holder binding</b> | iss(VP) == sub(VC); the presenter is the subject |
+  | <b>Validity period</b> | iat/exp within the acceptance window |
+  | nonce, aud | responds to this request |
+  | VC signature | issued by the asserted Issuer |
+  | trustIssuers | that Issuer is accepted by the request |
+  | credentialSchema | credential conforms to the requested schema |
+  | credentialStatus | credential is not revoked |
+
+  The VC "sub" is a did:prism long form and resolves from the
+  identifier alone. Only "iss" requires VDR access.
+
+  Holder binding and validity period checking are disabled by
+  default in the Verifier implementation and MUST be enabled
+  (PRESENTATION_VERIFY_HOLDER_BINDING, PRESENTATION_VERIFY_DATES).
+end note
+
+alt presentation valid
+    verifier -> verifier : PresentationVerified
+else presentation invalid
+    verifier -> verifier : PresentationVerificationFailed
+end
+verifier --> caddy_v : 200 OK
+caddy_v --> server : 200 OK
+
+server -> caddy_v : GET /present-proof/presentations (poll on thid)
+caddy_v --> server : terminal state
+
+== 6. Key Derivation ==
+
+note over peer, server #E8F5E9
+  <b>MSK and EMSK</b> [RFC5247], derived by both parties from the
+  same CEK using HKDF with SHA-256 [RFC5869]:
+
+    PRK  = HMAC-SHA-256(salt = thid, IKM = CEK)          (Section 2.2)
+    T(0) = ""
+    T(n) = HMAC-SHA-256(PRK, T(n-1) || label || n)       (Section 2.3)
+    OKM  = first 64 octets of T(1) || T(2) || ...
+
+    MSK   label = "EAP-DID-MSK"
+    EMSK  label = "EAP-DID-EMSK"
+
+    Session-Id = 0x39 || SHA-256(thid)     (Method Type 57)
+
+  Feeding T(n-1) into the next block is what distinguishes HKDF
+  from independent PRF evaluations. Omitting it still yields a
+  pseudorandom string but does not interoperate with any
+  conforming implementation.
+
+  thid is unique per exchange and serves as the salt, so repeated
+  presentations of one credential yield unrelated keys.
+
+  Peer:    holds the CEK from Section 3.3.
+  Server:  recovered the CEK in Section 5.
+end note
+
+== 7. Completion ==
+
+server -> peer : EAP-Success [RFC3748]
+
+note over peer, server #F0F0FF
+  <b>4-Way Handshake</b> [IEEE 802.11], on wireless media only. The
+  wired test deployment reports "no EAPOL-Key frames required".
+
+    PMK = MSK[0..31]
+    PTK = PRF(PMK, "Pairwise key expansion",
+              Min(AA,SPA) || Max(AA,SPA) ||
+              Min(ANonce,SNonce) || Max(ANonce,SNonce))
+    PTK = KCK(16) || KEK(16) || TK(32)
+
+  The handshake is where agreement on the CEK is confirmed. Absent
+  it, a successful authentication would leave the link unprotected.
+end note
+
+server -> peer : EAPOL-Key (message 1: ANonce)
+peer -> server : EAPOL-Key (message 2: SNonce, MIC)
+server -> peer : EAPOL-Key (message 3: GTK)
+peer -> server : EAPOL-Key (message 4: acknowledgement)
+
+note over peer, bc #DFFFD8
+  Controlled port authorised. The Issuer was not contacted and has
+  no record of the exchange.
+end note
+
+legend top
+  == Security Considerations (Trust Model D) ==
+
+  |= Property|= Status|
+  | Confidentiality against third parties | provided by the JWE; no TLS tunnel required |
+  | Holder proof of possession | ES256K over the subject key; holder binding enforced |
+  | Replay resistance | per-exchange challenge, jti, bounded exp |
+  | Issuer authenticity | resolved from the VDR |
+  | Revocation | credential status list |
+  | Subject privacy | no subject identifier published to the VDR |
+  | <b>Verifier authentication</b> | <b>not provided</b> |
+  | <b>Rogue authenticator resistance</b> | <b>not provided</b>; follows from the above |
+  | Verifier institutional authority | not provided; requires Model G |
+  | Selective disclosure, ZKP | not provided; the VC is disclosed in full |
+
+  An adversarial Authenticator MAY substitute its own identifier in
+  the invitation and thereby read the presentation. It cannot replay
+  the presentation to another Verifier: nonce and aud bind it to the
+  exchange and exp bounds its lifetime.
+
+  == Normative References ==
+
+  [RFC1952] GZIP file format         [RFC7515] JSON Web Signature
+  [RFC2865] RADIUS                   [RFC7516] JSON Web Encryption
+  [RFC3394] AES Key Wrap             [RFC7517] JSON Web Key
+  [RFC3748] EAP                      [RFC7518] JSON Web Algorithms
+  [RFC4648] Base16/32/64 encodings   [RFC7519] JSON Web Token
+  [RFC5247] EAP key management       [RFC7748] Elliptic curves for security
+  [RFC5869] HKDF                     [RFC8812] COSE/JOSE secp256k1 (ES256K)
+
+  [ECDH-1PU]        draft-madden-jose-ecdh-1pu-04
+  [DIDComm v2]      DIF, DIDComm Messaging
+  [VC-DATA-MODEL]   W3C, Verifiable Credentials Data Model
+  [DID-CORE]        W3C, Decentralized Identifiers
+  [IEEE 802.1X]     Port-Based Network Access Control
+  [IEEE 802.11]     Wireless LAN MAC and PHY Specifications
+
+  EAP Method Type 57 is used locally and is not assigned by IANA.
+
+  == Implementation ==
+
+  |= Source file|= Role|
+  | eap_server_did.c | request, challenge, fragmentation, CEK recovery, relay |
+  | eap_did.c | request handling, presentation construction, fragmentation |
+  | eap_did_vp.c | VP JWT construction (ES256K), credential loading |
+  | eap_did_jwe.c | ECDH-1PU, Concat KDF, AES Key Wrap, A256CBC-HS512 |
+  | eap_did_common.c | HKDF, Session-Id, did:peer parsing |
+  | eap_did_http.c | HTTP transport, gzip, JSON field extraction |
+endlegend
+
+@enduml

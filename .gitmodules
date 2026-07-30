@@ -1,0 +1,9 @@
+# .gitmodules — fork repos as submodules (no patch layer)
+#
+# hostap: EAP-DID implementation on branch did5
+# cloud-agent + didcomm-jvm: stock Docker images, no source needed
+
+[submodule "third_party/hostap"]
+	path = third_party/hostap
+	url = https://github.com/caciano/hostap.git
+	branch = did-model-d

@@ -1,0 +1,124 @@
+# docker-compose.cardano.yml — Cardano preprod override
+# Issue #28: Add Cardano node (Mithril) + wallet + db-sync for real ledger benchmarks
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f testbed/docker-compose.cardano.yml up -d
+#
+# Requirements:
+#   - 9 GB RAM available for Cardano stack
+#   - 35 GB disk for preprod sync
+#   - Network: ledger-net must exist (created by docker-compose.yml)
+
+version: "3.9"
+
+services:
+  cardano-node:
+    image: ghcr.io/blinklabs-io/cardano-node:latest
+    container_name: swarm-cardano-node
+    restart: unless-stopped
+    environment:
+      - NETWORK=preprod
+    command:
+      - run
+      - --config=/config/config.json
+      - --topology=/config/topology.json
+      - --database-path=/data/db
+      - --socket-path=/ipc/node.socket
+      - --host-addr=0.0.0.0
+      - --port=3001
+      - +RTS
+      - -N2
+      - -H2G
+      - -qT
+      - -RTS
+    volumes:
+      - cardano-node-db:/data/db
+      - cardano-node-ipc:/ipc
+      - ./testbed/cardano/config:/config:ro
+    networks:
+      - ledger-net
+    mem_limit: 6g
+    cpus: 2.0
+
+  cardano-wallet:
+    image: ghcr.io/intersectmbo/cardano-wallet:v2026-05-11
+    container_name: swarm-cardano-wallet
+    restart: unless-stopped
+    depends_on:
+      - cardano-node
+    environment:
+      - NETWORK=preprod
+    command:
+      - serve
+      - --node-socket=/ipc/node.socket
+      - --database=/data/wallet-db
+      - --listen-address=0.0.0.0
+      - --port=8090
+    volumes:
+      - cardano-node-ipc:/ipc:ro
+      - cardano-wallet-db:/data/wallet-db
+    ports:
+      - "8090:8090"
+    networks:
+      - ledger-net
+    mem_limit: 1g
+    cpus: 1.0
+
+  dbsync-postgres:
+    image: postgres:15
+    container_name: swarm-dbsync-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=dbsync
+      - POSTGRES_PASSWORD=dbsync
+      - POSTGRES_DB=cexplorer
+    volumes:
+      - dbsync-postgres-data:/var/lib/postgresql/data
+    networks:
+      - ledger-net
+    mem_limit: 1g
+    cpus: 0.5
+
+  cardano-db-sync:
+    image: ghcr.io/intersectmbo/cardano-db-sync:13.7.1.0
+    container_name: swarm-cardano-dbsync
+    restart: unless-stopped
+    depends_on:
+      cardano-node:
+        condition: service_started
+      dbsync-postgres:
+        condition: service_started
+    environment:
+      - NETWORK=preprod
+      - POSTGRES_HOST=dbsync-postgres
+      - POSTGRES_USER=dbsync
+      - POSTGRES_PASSWORD=dbsync
+      - POSTGRES_DB=cexplorer
+      - DB_SYNC_PRUNE_TX_OUT=true
+    command:
+      - --node-socket=/ipc/node.socket
+      - --config=/config/config.json
+      - --schema-dir=/schema
+      - --state-dir=/data
+    volumes:
+      - cardano-node-ipc:/ipc:ro
+      - ./testbed/cardano/config:/config:ro
+      - dbsync-state:/data
+    networks:
+      - ledger-net
+    mem_limit: 3g
+    cpus: 1.5
+
+volumes:
+  cardano-node-db:
+  cardano-node-ipc:
+  cardano-wallet-db:
+  dbsync-postgres-data:
+  dbsync-state:
+
+# The Cardano stack is the ledger's own infrastructure, so it lives where the
+# ledger's storage lives. The PRISM node is already on ledger-net and reaches it
+# from there; nothing else in the deployment may.
+networks:
+  ledger-net:
+    external: true

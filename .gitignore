@@ -1,0 +1,8 @@
+# Build stamps
+.stamps/
+
+# Generated testbed artifacts
+testbed/env.test
+testbed/did-keys/
+testbed/benchmark-results/
+testbed/config/hostapd/.method

@@ -1,0 +1,77 @@
+@startuml architecture
+title EAP-DID: Entities and Interfaces\nFigure 1
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+
+rectangle "Peer System" #E8F5E9 {
+    component "EAP Peer\n(wpa_supplicant,\nEAP-DID method)" as wpa
+    artifact "Credential Store\nVC (JWT), subject\nsecp256k1 key,\nX25519 key, did:peer" as cred
+}
+
+rectangle "Access Network" #E3F2FD {
+    component "Authenticator\n(IEEE 802.1X PAE)" as ap
+    component "EAP Server\n(hostapd,\nEAP-DID method)" as radius
+}
+
+rectangle "Relying Infrastructure" #FFF3E0 {
+    component "Verifier\n(DIDComm endpoint,\nVP validation)" as verifier
+    component "Key Service\n<i>non-normative</i>\n<i>test deployment only</i>" as keysvc
+}
+
+database "Verifiable Data\nRegistry (VDR)\nIssuer DIDs,\nstatus lists" as ledger #FFEBEE
+
+rectangle "Issuing Authority\n(enrolment phase only)" #F3E5F5 {
+    component "Issuer\n(VC issuance)" as issuer
+}
+
+wpa <-right-> ap : EAPOL [802.1X]\nEAP [RFC3748], Method Type 57
+ap -right-> radius : RADIUS [RFC2865]\nEAP-Message AVP
+radius -right-> verifier : presentation request;\nVP relay; status poll
+radius --> keysvc : recipient key retrieval
+keysvc --> verifier : key store read
+verifier --> ledger : issuer DID resolution;\ncredential status
+
+cred .up.> wpa : provisioned out of band
+issuer .up.> cred : VC issuance [DIDComm v2]
+issuer .right.> ledger : DID publication
+
+cred -[hidden]down- issuer
+
+note bottom of radius
+  <b>Key derivation (EAP server)</b>
+  MSK, EMSK per [RFC5247] are derived from the
+  JWE Content Encryption Key (CEK) recovered by
+  unwrapping the Verifier recipient entry.
+  See Figure 3, Section 6.
+end note
+
+note bottom of wpa
+  <b>Key derivation (EAP peer)</b>
+  The peer generates the CEK when constructing the
+  JWE and retains it. No Holder agent participates
+  in the authentication exchange.
+end note
+
+note right of keysvc
+  <b>Non-normative component.</b>
+  Discloses private key material. Present only
+  because the EAP server and the Verifier are
+  distinct processes in this deployment. It is
+  removed when the EAP server performs VP
+  validation locally.
+end note
+
+legend bottom
+  <b>Trust model</b>: Model D of eap-did-models.md.
+  The Issuer DID is the only identifier published to the VDR.
+  The Peer identifier is a did:prism long form; the Verifier
+  identifier is a did:peer minted per exchange.
+  --
+  Solid: authentication exchange, per association.
+  Dashed: enrolment, performed once.
+  The Issuer is not contacted during authentication.
+endlegend
+
+@enduml

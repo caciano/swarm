@@ -1,0 +1,225 @@
+# docker-compose.benchmark.yml
+# Issue #14: Benchmark EAP-DID vs EAP-TLS vs EAP-MD5
+#
+# Three profiles controlled by COMPOSE_PROFILES:
+#   COMPOSE_PROFILES=did     → EAP-DID (current implementation)
+#   COMPOSE_PROFILES=tls     → EAP-TLS (PKI certs, no Identus)
+#   COMPOSE_PROFILES=md5     → EAP-MD5 (user/password)
+#   COMPOSE_PROFILES=did,tls,md5 → all three (for sequential benchmark)
+#
+# Usage:
+#   docker compose -f docker-compose.benchmark.yml --profile did up -d
+#   docker compose -f docker-compose.benchmark.yml --profile tls up -d
+#   docker compose -f docker-compose.benchmark.yml --profile md5 up -d
+#
+# Resource limits: 2 CPUs, 1GB RAM per container for consistency.
+
+name: swarm-benchmark
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: swarm-testbed:latest
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  init: true
+  cpus: 2.0
+  mem_limit: 1g
+
+networks:
+  # This harness has an EAP segment of its own, on its own pool. The
+  # entrypoints identify the EAP port by the address they find on it and then
+  # flush that address, so they are told which pool to look for
+  # (EAPOL_SUBNET_PREFIX below); the deployment in docker-compose.yml uses
+  # 172.30. and also carries the bridge ACL of scripts/eapol-guard.sh, which
+  # this file does not.
+  bench_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: bench-br0
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+services:
+  # ── Bridge init ──────────────────────────────────────────────
+  init-bridge:
+    <<: *common
+    container_name: bench-init-bridge
+    network_mode: host
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          if ip link show bench-br0 >/dev/null 2>&1; then
+            ip link set dev bench-br0 type bridge group_fwd_mask 0x8 && exit 0
+          fi
+          sleep 1
+        done
+        exit 1
+    restart: 'no'
+
+  # ═══════════════════════════════════════════════════════════════
+  # Profile: EAP-DID (existing implementation)
+  # ═══════════════════════════════════════════════════════════════
+  did-authradius:
+    <<: *common
+    profiles: [did]
+    container_name: bench-did-authradius
+    hostname: did-authradius
+    environment:
+      AUTH_CONF: /etc/hostapd/hostapd.passthrough.conf
+      RADIUS_CONF: /etc/hostapd/radius.conf
+      EAP_IFACE: eth1
+      EAPOL_SUBNET_PREFIX: "172.31."
+      UPSTREAM_HOST: caddy-verifier
+      UPSTREAM_PORT: '8082'
+      PROXY_PORT: '2020'
+      PROXY_A_OOB_URL: http://bench-did-supplicant:2022/oob-invite
+      ISSUER_DID: ${ISSUER_DID:-did:prism:test}
+      SCHEMA_ID: ${SCHEMA_ID:-https://raw.githubusercontent.com/cristiandossantos/identus/refs/heads/main/bredu-schema.json}
+      HOSTAPD_NOTIFY_ENABLED: 'true'
+      HOSTAPD_NOTIFY_URL: 'http://127.0.0.1:2021/'
+      LOG_LEVEL: INFO
+    volumes:
+      - ./config/hostapd:/etc/hostapd:ro
+    entrypoint: ["/usr/local/sbin/entrypoint-authradius.sh"]
+    networks:
+      bench_net:
+        ipv4_address: 172.31.0.10
+
+  did-supplicant:
+    <<: *common
+    profiles: [did]
+    container_name: bench-did-supplicant
+    hostname: did-supplicant
+    environment:
+      WPA_CONF: /etc/wpa_supplicant/wpa_supplicant.conf
+      EAP_IFACE: eth1
+      EAPOL_SUBNET_PREFIX: "172.31."
+      START_DELAY: '3'
+      UPSTREAM_HOST: '127.0.0.1'
+      UPSTREAM_PORT: '2023'
+      PROXY_PORT: '2022'
+      HOLDER_ACCEPT_URL: 'http://caddy-holder:8081/cloud-agent/present-proof/presentations/accept-invitation'
+      HOLDER_PRESENTATIONS_BASE_URL: 'http://caddy-holder:8081/cloud-agent/present-proof/presentations'
+      PRESENTATION_STATUS_RETRIES: '60'
+      PRESENTATION_STATUS_DELAY_MS: '500'
+      LOG_LEVEL: INFO
+    volumes:
+      - ./config/wpa_supplicant:/etc/wpa_supplicant:ro
+    entrypoint: ["/usr/local/sbin/entrypoint-supplicant.sh"]
+    depends_on:
+      init-bridge:
+        condition: service_completed_successfully
+      did-authradius:
+        condition: service_started
+    networks:
+      bench_net:
+        ipv4_address: 172.31.0.20
+
+  # ═══════════════════════════════════════════════════════════════
+  # Profile: EAP-TLS (PKI certificates, no Identus, no proxies)
+  # ═══════════════════════════════════════════════════════════════
+  tls-authradius:
+    <<: *common
+    profiles: [tls]
+    container_name: bench-tls-authradius
+    hostname: tls-authradius
+    environment:
+      AUTH_CONF: /etc/hostapd/hostapd.tls.conf
+      EAP_IFACE: eth1
+      EAPOL_SUBNET_PREFIX: "172.31."
+      LOG_LEVEL: INFO
+    volumes:
+      - ./config/hostapd:/etc/hostapd:ro
+      - ./config/certs:/etc/hostapd/certs:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        hostapd -t /etc/hostapd/hostapd.tls.conf 2>&1
+    depends_on:
+      init-bridge:
+        condition: service_completed_successfully
+    networks:
+      bench_net:
+        ipv4_address: 172.31.0.30
+
+  tls-supplicant:
+    <<: *common
+    profiles: [tls]
+    container_name: bench-tls-supplicant
+    hostname: tls-supplicant
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - ./config/wpa_supplicant:/etc/wpa_supplicant:ro
+      - ./config/certs:/etc/certs:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sleep 3
+        wpa_supplicant -D wired -i eth1 -c /etc/wpa_supplicant/wpa_supplicant.tls.conf -dd 2>&1
+    depends_on:
+      init-bridge:
+        condition: service_completed_successfully
+      tls-authradius:
+        condition: service_started
+    networks:
+      bench_net:
+        ipv4_address: 172.31.0.40
+
+  # ═══════════════════════════════════════════════════════════════
+  # Profile: EAP-MD5 (user/password, simplest)
+  # ═══════════════════════════════════════════════════════════════
+  md5-authradius:
+    <<: *common
+    profiles: [md5]
+    container_name: bench-md5-authradius
+    hostname: md5-authradius
+    environment:
+      AUTH_CONF: /etc/hostapd/hostapd.md5.conf
+      EAP_IFACE: eth1
+      EAPOL_SUBNET_PREFIX: "172.31."
+      LOG_LEVEL: INFO
+    volumes:
+      - ./config/hostapd:/etc/hostapd:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        hostapd -t /etc/hostapd/hostapd.md5.conf 2>&1
+    depends_on:
+      init-bridge:
+        condition: service_completed_successfully
+    networks:
+      bench_net:
+        ipv4_address: 172.31.0.50
+
+  md5-supplicant:
+    <<: *common
+    profiles: [md5]
+    container_name: bench-md5-supplicant
+    hostname: md5-supplicant
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - ./config/wpa_supplicant:/etc/wpa_supplicant:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sleep 3
+        wpa_supplicant -D wired -i eth1 -c /etc/wpa_supplicant/wpa_supplicant.md5.conf -dd 2>&1
+    depends_on:
+      init-bridge:
+        condition: service_completed_successfully
+      md5-authradius:
+        condition: service_started
+    networks:
+      bench_net:
+        ipv4_address: 172.31.0.60
